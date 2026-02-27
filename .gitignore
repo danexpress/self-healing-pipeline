@@ -7,4 +7,5 @@ __pycache__/
 *.log
 airflow.db
 airflow.cfg
+airflow.cfg.lock
 simple_auth_manager_passwords.json.generated
