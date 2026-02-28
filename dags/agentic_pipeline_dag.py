@@ -368,8 +368,143 @@ def self_healing_pipeline():
         return healed_reviews
 
     @task()
-    def analyze_sentiment_batch(healed_reviews: list[dict], model_info: dict):
+    def batch_analyze_sentiment(healed_reviews: list[dict], model_info: dict):
         if not healed_reviews:
             return []
         logger.info(f"Analyzing {len(healed_reviews)} reviews for sentiment.")
         return _analyzed_with_ollama(healed_reviews, model_info)
+
+    @task()
+    def aggregate_results(results: list[list[dict]]):
+        context = get_current_context()
+        params = context["params"]
+        results = list(results)
+
+        total = len(results)
+
+        success_count = sum(1 for r in results if r.get("status") == "success")
+        healed_count = sum(1 for r in results if r.get("status") == "healed")
+        degraded_count = sum(1 for r in results if r.get("status") == "degraded")
+
+        sentiment_dist = {"POSITIVE": 0, "NEGATIVE": 0, "NEUTRAL": 0}
+        for r in results:
+            sentiment = r.get("predicted_sentiment", "NEUTRAL")
+            sentiment_dist[sentiment] = sentiment_dist.get(sentiment, 0) + 1
+
+        healing_stats = {}
+        for r in results:
+            if r.get("healing_applied"):
+                action = r.get("healing_actions", "unknown")
+                healing_stats[action] = healing_stats.get(action, 0) + 1
+
+        start_sentiment = {}
+        for r in results:
+            stars = r.get("stars", 0)
+            sentiment = r.get("predicted_sentiment")
+            if stars not in sentiment:
+                key = f"{int(stars)}_stars"
+                if key not in start_sentiment:
+                    start_sentiment[key] = {"POSITIVE": 0, "NEGATIVE": 0, "NEUTRAL": 0}
+            start_sentiment[key][sentiment] += 1
+
+        confidence_by_status = {"success": [], "healed": [], "degraded": []}
+        for r in results:
+            status = r.get("status")
+            confidence = r.get("confidence", 0)
+            if status in confidence_by_status:
+                confidence_by_status[status].append(confidence)
+
+        avg_confidence = {
+            status: (sum(conf_list) / len(conf_list)) if conf_list else 0
+            for status, conf_list in confidence_by_status.items()
+        }
+
+        summary = {
+            "run_info": {
+                "timestamp": datetime.now().isoformat(),
+                "batch_size": params.get("batch_size", Config.DEFAULT_BATCH_SIZE),
+                "offset": params.get("offset", Config.DEFAULT_OFFSET),
+                "input_file": params.get("input_file", Config.INPUT_FILE),
+            },
+            "totals": {
+                "processed": total,
+                "success": success_count,
+                "healed": healed_count,
+                "degraded": degraded_count,
+            },
+            "rates": {
+                "success_rate": round(success_count / max(total, 1), 4),
+                "healed_rate": round(healed_count / max(total, 1), 4),
+                "degraded_rate": round(degraded_count / max(total, 1), 4),
+            },
+            "sentiment_distribution": sentiment_dist,
+            "healing_statistics": healing_stats,
+            "start_sentiment_correlation": start_sentiment,
+            "avg_confidence": avg_confidence,
+            "results": results,
+        }
+
+        os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        offset = params.get("offset", Config.DEFAULT_OFFSET)
+        output_file = f"{Config.OUTPUT_DIR}/sentiment_analysis_summary_{timestamp}_Offset{offset}.json"
+
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=4, default=str, ensure_ascii=False)
+
+        logger.info(f"Summary written to {output_file}")
+        logger.info(
+            f"Processed {total} reviews. {success_count} success, {healed_count} healed, {degraded_count} degraded."
+        )
+
+        return {k: v for k, v in summary.items() if k != "results"}
+
+    @task()
+    def generate_health_report(summary: dict):
+        # Generate a health report based on the summary
+        total = summary["totals"]["processed"]
+        healed = summary["totals"]["healed"]
+        degraded = summary["totals"]["degraded"]
+
+        if degraded > total * 0.1:
+            health_status = "CRITICAL"
+        elif degraded > 0:
+            health_status = "DEGRADED"
+        elif healed > total * 0.5:
+            health_status = "WARNING"
+        else:
+            health_status = "HEALTHY"
+
+        report = {
+            "pipeline": "self_healing_pipeline",
+            "timestamp": datetime.now().isoformat(),
+            "health_status": health_status,
+            "run_info": summary["run_info"],
+            "metrics": {
+                "total_processed": total,
+                "success_rate": summary["rates"]["success_rate"],
+                "healed_rate": summary["rates"]["healed_rate"],
+                "degraded_rate": summary["rates"]["degraded_rate"],
+            },
+            "sentiment_distribution": summary["sentiment_distribution"],
+            "healing_statistics": summary["healing_statistics"],
+            "avg_confidence": summary["avg_confidence"],
+        }
+        logger.info(f"Pipeline Health Report: {json.dumps(report, indent=2)}")
+        logger.info(f'Success Rate: {summary["rates"]["success_rate"]}')
+        logger.info(f'Healed Rate: {summary["rates"]["healed_rate"]}')
+        logger.info(f'Degraded Rate: {summary["rates"]["degraded_rate"]}')
+
+        return report
+
+    model_info = load_model()
+    reviews = load_reviews()
+
+    healed_reviews = diagnose_and_heal_batch(reviews)
+    analyzed_results = batch_analyze_sentiment(healed_reviews, model_info)
+
+    summary = aggregate_results(analyzed_results)
+    generate_health_report = generate_health_report(summary)
+
+
+self_healing_pipeline_dag = self_healing_pipeline
