@@ -2,6 +2,7 @@ from datetime import timedelta
 import datetime
 import itertools
 import json
+import re
 from airflow.sdk import dag, task, Param, get_current_context
 import os
 import logging
@@ -149,6 +150,163 @@ def _parse_ollama_response(reponse_text: str):
         return {"label": "NEUTRAL", "score": 0.50}
 
 
+def _heal_review(review: dict) -> dict:
+    text = review.get("text", "")
+
+    result = {
+        "review_id": review.get("review_id"),
+        "business_id": review.get("business_id"),
+        "stars": review.get("stars", 0),
+        "original_text": None,
+        "error_type": None,
+        "action_taken": "none",
+        "was_healed": False,
+        "metadata": {
+            "user_id": review.get("user_id"),
+            "date": review.get("date"),
+            "useful": review.get("useful", 0),
+            "funny": review.get("funny", 0),
+            "cool": review.get("cool", 0),
+        },
+    }
+
+    if isinstance(text, (str, int, float, bool, type(None))):
+        result["original_text"] = text
+    else:
+        result["original_text"] = str(text) if text else None
+
+    if text is None:
+        result["error_type"] = "missing_text"
+        result["action_taken"] = "filled_with_placeholder"
+        result["healed_text"] = "No review text provided."
+        result["was_healed"] = True
+        return result
+    elif not isinstance(text, str):
+        result["error_type"] = "wrong_type"
+        try:
+            converted = str(text).strip()
+            result["healed_text"] = (
+                converted if converted else "No review text provided."
+            )
+        except Exception as e:
+            result["healed_text"] = "Conversion failed."
+
+        result["action_taken"] = "type_conversion"
+        result["was_healed"] = True
+    elif not text.strip():
+        result["error_type"] = "empty_text"
+        result["action_taken"] = "filled_with_placeholder"
+        result["healed_text"] = "No review text provided."
+        result["was_healed"] = True
+    elif not re.search(r"[A-Za-z0-9]", text):
+        result["error_type"] = "special_characters_only"
+        result["healed_text"] = "[Non-text content]"
+        result["action_taken"] = "replaced_special_characters"
+        result["was_healed"] = True
+    elif len(text) > Config.MAX_TEXT_LENGTH:
+        result["error_type"] = "text_too_long"
+        result["healed_text"] = text[: Config.MAX_TEXT_LENGTH - 3] + "..."
+        result["action_taken"] = "truncated_text"
+        result["was_healed"] = True
+    else:
+        result["healed_text"] = text.strip()
+        result["was_healed"] = False
+
+    return result
+
+
+def _analyzed_with_ollama(handled_reviews: list[dict], model_info: dict) -> list[dict]:
+    import ollama
+    import time
+
+    model_name = model_info.get("model_name")
+    ollama_host = model_info.get("ollama_host", Config.OLLAMA_HOST)
+
+    try:
+        client = ollama.Client(host=ollama_host)
+    except Exception as e:
+        logger.error(f"Failed to connect to OLLAMA at {ollama_host}: {e}")
+        return _created_degraded_results(handled_reviews, str(e))
+
+    results = []
+    total = len(healed_reviews)
+
+    for idx, review in enumerate(healed_reviews):
+        text = review.get("healed_text", "")
+        prediction = None
+
+        for attempt in range(Config.OLLAMA_RETRIES):
+            try:
+                prompt = f""" 
+                    Analyze the sentiment of this review and classify it as  POSITIVE, NEGATIVE, or NEUTRAL.
+                    Review: "{text}"
+                    Reply with ONLY a JSON object: {{"sentiment": "POSITIVE", "confidence": 0.95}}
+                    """
+
+                response = client.chat(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={"temperature": 0.1},
+                )
+
+                response_text = response["message"]["content"].strip()
+                prediction = _parse_ollama_response(response_text)
+                break
+            except Exception as e:
+                if attempt < Config.OLLAMA_RETRIES - 1:
+                    logger.warning(
+                        f"Attempt {attempt + 1} failed for review {review['review_id']}: {e}. Retrying..."
+                    )
+                    time.sleep(1)
+                else:
+                    logger.error(
+                        f"All attempts failed for review {review['review_id']}: {e}"
+                    )
+                    prediction = {"label": "NEUTRAL", "score": 0.5, "error": str(e)}
+
+        if (idx + 1) % 10 == 0 or idx == total:
+            logger.info(f"Processed {idx + 1}/{total} reviews for sentiment analysis.")
+
+        results.append(
+            {
+                "review_id": review.get("review_id"),
+                "business_id": review.get("business_id"),
+                "stars": review.get("stars", 0),
+                "text": review.get("healed_text", ""),
+                "original_text": review.get("original_text", ""),
+                "predicted_sentiment": prediction.get("label"),
+                "confidence": round(prediction.get("score"), 4),
+                "status": "healed" if review.get("was_healed") else "success",
+                "healing_applied": review.get("was_healed"),
+                "healing_actions": (
+                    review.get("action_taken") if review.get("was_healed") else None
+                ),
+                "error_type": (
+                    review.get("error_type") if review.get("was_healed") else None
+                ),
+                "metadata": review.get("metadata", {}),
+            }
+        )
+    logger.info(f"Ollama inference complete: {len(results)}/{total} reviews processed.")
+    return results
+
+
+def _created_degraded_results(
+    handled_reviews: list[dict], error_message: str
+) -> list[dict]:
+    return [
+        {
+            **review,
+            "text": review.get("healed_text", ""),
+            "predicted_sentiment": "NEUTRAL",
+            "confidence": 0.5,
+            "status": "degraded",
+            "error_message": error_message,
+        }
+        for review in handled_reviews
+    ]
+
+
 @dag(
     dag_id="self_healing_pipeline",
     default_args=default_args,
@@ -201,3 +359,17 @@ def self_healing_pipeline():
             f"Loading reviews with batch size: {batch_size} and offset: {offset}"
         )
         return _load_from_file(params, batch_size, offset)
+
+    @task()
+    def diagnose_and_heal_batch(reviews: list[dict]):
+        healed_reviews = [_heal_review(review) for review in reviews]
+        heal_count = sum(1 for r in healed_reviews if r.get("was_healed", True))
+        logger.info(f"Healed {heal_count} out of {len(reviews)} reviews in the batch.")
+        return healed_reviews
+
+    @task()
+    def analyze_sentiment_batch(healed_reviews: list[dict], model_info: dict):
+        if not healed_reviews:
+            return []
+        logger.info(f"Analyzing {len(healed_reviews)} reviews for sentiment.")
+        return _analyzed_with_ollama(healed_reviews, model_info)
