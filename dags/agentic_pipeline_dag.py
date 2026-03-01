@@ -1,10 +1,10 @@
-from datetime import timedelta
-import datetime
 import itertools
 import json
-import re
-from airflow.sdk import dag, task, Param, get_current_context
 import os
+import re
+from datetime import timedelta, datetime
+
+from airflow.sdk import dag, task, Param, get_current_context
 import logging
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ class Config:
     INPUT_FILE = os.getenv(
         "PIPELINE_INPUT_FILE", f"{BASE_DIR}/input/yelp_academic_dataset_review.json"
     )
-    OUTPUT_FILE = os.getenv("PIPELINE_OUTPUT_FILE", f"{BASE_DIR}/output/")
+    OUTPUT_DIR = os.getenv("PIPELINE_OUTPUT_DIR", f"{BASE_DIR}/output/")
 
     MAX_TEXT_LENGTH = int(os.getenv("PIPELINE_MAX_TEXT_LENGTH", 2000))
     DEFAULT_BATCH_SIZE = 100
@@ -25,7 +25,7 @@ class Config:
 
     # OLLAMA SETTINGS
     OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", " llama3.2")
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
     OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", 120))
     OLLAMA_RETRIES = int(os.getenv("OLLAMA_RETRIES", 3))
 
@@ -34,7 +34,7 @@ default_args = {
     "owner": "cridix",
     "depends_on_past": False,
     "retries": 2,
-    "retry_delay": timedelta(minutes=5),
+    "retry_delay": timedelta(minutes=1),
     "execution_timeout": timedelta(minutes=30),
 }
 
@@ -42,23 +42,23 @@ default_args = {
 def _load_ollama_model(model_name: str):
     import ollama
 
-    logger.info(f"Loading Ollama model: {model_name}")
-    logger.info(f"Ollama host: {Config.OLLAMA_HOST}")
+    logger.info(f"Loading OLLAMA model: {model_name}")
+    logger.info(f"OLLAMA Host: {Config.OLLAMA_HOST}")
 
-    client = ollama.Ollama(host=Config.OLLAMA_HOST)
+    client = ollama.Client(host=Config.OLLAMA_HOST)
 
     try:
         client.show(model_name)
-        logger.info(f"OLLAMA model {model_name} is available")
+        logger.info(f"OLLAMA model {model_name} is available.")
     except ollama.ResponseError as e:
         logger.info(
-            "Model not found locally, Attempting to pull form remote repository..."
+            "Model not found locally. Attempting to pull from remote repository..."
         )
         try:
             client.pull(model_name)
-            logger.info(f"OLLAMA model {model_name} pulled successfully")
+            logger.info(f"OLLAMA model {model_name} pulled successfully.")
         except ollama.ResponseError as pull_error:
-            logger.error(f"Failed to pull OLLAMA model {model_name}: {pull_error}")
+            logger.error(f"Failed to pull model {model_name}: {pull_error}")
             raise
 
     test_response = client.chat(
@@ -70,9 +70,8 @@ def _load_ollama_model(model_name: str):
             }
         ],
     )
-
-    test_results = test_response["message"]["content"].strip().upper()
-    logger.info(f"Model validation passed with test response: {test_results}")
+    test_result = test_response["message"]["content"].strip().upper()
+    logger.info(f"Model validation passed with test response: {test_result}")
 
     return {
         "backend": "ollama",
@@ -97,7 +96,7 @@ def _load_from_file(params: dict, batch_size: int, offset: int):
 
         for line in sliced:
             try:
-                reviews = json.load(line.strip())
+                review = json.loads(line.strip())
                 reviews.append(
                     {
                         "review_id": review.get("review_id"),
@@ -115,39 +114,38 @@ def _load_from_file(params: dict, batch_size: int, offset: int):
                 logger.warning(f"Skipping invalid JSON line: {e}")
                 continue
 
-    logger.info(
-        f"Loaded {len(reviews)} reviews from file starting from offset {offset}."
-    )
+    logger.info(f"Loaded {len(reviews)} reviews from file starting at offset {offset}.")
     return reviews
 
 
-def _parse_ollama_response(reponse_text: str):
+def _parse_ollama_response(response_text: str):
     try:
+
         clean_text = response_text.strip()
 
         if clean_text.startswith("```"):
             lines = clean_text.split("\n")
             clean_text = (
-                "\n".join(lines[1:-1]) if lines[-1] == "```" else "\n".join(lines[1:])
+                "\n".join(lines[1:-1])
+                if lines[-1].strip() == "```"
+                else "\n".join(lines[1:])
             )
 
-            parsed = json.loads(clean_text)
-            sentiment = parsed.get("sentiment", "NEUTRAL").upper()
-            confidence = float(parsed.get("confidence", 0.0))
+        parsed = json.loads(clean_text)
+        sentiment = parsed.get("sentiment", "NEUTRAL").upper()
+        confidence = float(parsed.get("confidence", 0.0))
 
-            if sentiment not in ["POSITIVE", "NEGATIVE", "NEUTRAL"]:
-                sentiment = "NEUTRAL"
+        if sentiment not in ["POSITIVE", "NEGATIVE", "NEUTRAL"]:
+            sentiment = "NEUTRAL"
 
-            return {"label": sentiment, "score": min(max(confidence, 0.0), 1.0)}
+        return {"label": sentiment, "score": min(max(confidence, 0.0), 1.0)}
     except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
-
         upper_text = response_text.strip().upper()
         if "POSITIVE" in upper_text:
             return {"label": "POSITIVE", "score": 0.75}
         elif "NEGATIVE" in upper_text:
             return {"label": "NEGATIVE", "score": 0.75}
-
-        return {"label": "NEUTRAL", "score": 0.50}
+        return {"label": "NEUTRAL", "score": 0.5}
 
 
 def _heal_review(review: dict) -> dict:
@@ -195,16 +193,16 @@ def _heal_review(review: dict) -> dict:
         result["was_healed"] = True
     elif not text.strip():
         result["error_type"] = "empty_text"
-        result["action_taken"] = "filled_with_placeholder"
         result["healed_text"] = "No review text provided."
+        result["action_taken"] = "filled_with_placeholder"
         result["was_healed"] = True
-    elif not re.search(r"[A-Za-z0-9]", text):
+    elif not re.search(r"[a-zA-Z0-9]", text):
         result["error_type"] = "special_characters_only"
         result["healed_text"] = "[Non-text content]"
         result["action_taken"] = "replaced_special_characters"
         result["was_healed"] = True
     elif len(text) > Config.MAX_TEXT_LENGTH:
-        result["error_type"] = "text_too_long"
+        result["error_type"] = "too_long"
         result["healed_text"] = text[: Config.MAX_TEXT_LENGTH - 3] + "..."
         result["action_taken"] = "truncated_text"
         result["was_healed"] = True
@@ -215,7 +213,7 @@ def _heal_review(review: dict) -> dict:
     return result
 
 
-def _analyzed_with_ollama(handled_reviews: list[dict], model_info: dict) -> list[dict]:
+def _analyze_with_ollama(healed_reviews: list[dict], model_info: dict) -> list[dict]:
     import ollama
     import time
 
@@ -225,8 +223,8 @@ def _analyzed_with_ollama(handled_reviews: list[dict], model_info: dict) -> list
     try:
         client = ollama.Client(host=ollama_host)
     except Exception as e:
-        logger.error(f"Failed to connect to OLLAMA at {ollama_host}: {e}")
-        return _created_degraded_results(handled_reviews, str(e))
+        logger.error(f"Failed to connect to OLLAMA host {ollama_host}: {e}")
+        return _created_degraded_results(healed_reviews, str(e))
 
     results = []
     total = len(healed_reviews)
@@ -237,10 +235,10 @@ def _analyzed_with_ollama(handled_reviews: list[dict], model_info: dict) -> list
 
         for attempt in range(Config.OLLAMA_RETRIES):
             try:
-                prompt = f""" 
-                    Analyze the sentiment of this review and classify it as  POSITIVE, NEGATIVE, or NEUTRAL.
+                prompt = f"""
+                    Analyze the sentiment of this review and classify it as POSITIVE, NEGATIVE, or NEUTRAL. 
                     Review: "{text}"
-                    Reply with ONLY a JSON object: {{"sentiment": "POSITIVE", "confidence": 0.95}}
+                    Reply with ONLY a JSON object: {{"sentiment": "POSITIVE", "confidence": 0.95}}.
                     """
 
                 response = client.chat(
@@ -252,19 +250,20 @@ def _analyzed_with_ollama(handled_reviews: list[dict], model_info: dict) -> list
                 response_text = response["message"]["content"].strip()
                 prediction = _parse_ollama_response(response_text)
                 break
+
             except Exception as e:
                 if attempt < Config.OLLAMA_RETRIES - 1:
                     logger.warning(
-                        f"Attempt {attempt + 1} failed for review {review['review_id']}: {e}. Retrying..."
+                        f'Attempt {attempt+1} failed for review {review.get("review_id")}: {e}. Retrying...'
                     )
                     time.sleep(1)
                 else:
                     logger.error(
-                        f"All attempts failed for review {review['review_id']}: {e}"
+                        f'All attempts failed for review {review.get("review_id")}: {e}.'
                     )
                     prediction = {"label": "NEUTRAL", "score": 0.5, "error": str(e)}
 
-        if (idx + 1) % 10 == 0 or idx == total:
+        if (idx + 1) % 10 == 0 or (idx + 1) == total:
             logger.info(f"Processed {idx + 1}/{total} reviews for sentiment analysis.")
 
         results.append(
@@ -278,7 +277,7 @@ def _analyzed_with_ollama(handled_reviews: list[dict], model_info: dict) -> list
                 "confidence": round(prediction.get("score"), 4),
                 "status": "healed" if review.get("was_healed") else "success",
                 "healing_applied": review.get("was_healed"),
-                "healing_actions": (
+                "healing_action": (
                     review.get("action_taken") if review.get("was_healed") else None
                 ),
                 "error_type": (
@@ -287,12 +286,13 @@ def _analyzed_with_ollama(handled_reviews: list[dict], model_info: dict) -> list
                 "metadata": review.get("metadata", {}),
             }
         )
+
     logger.info(f"Ollama inference complete: {len(results)}/{total} reviews processed.")
     return results
 
 
 def _created_degraded_results(
-    handled_reviews: list[dict], error_message: str
+    healed_reviews: list[dict], error_message: str
 ) -> list[dict]:
     return [
         {
@@ -303,7 +303,7 @@ def _created_degraded_results(
             "status": "degraded",
             "error_message": error_message,
         }
-        for review in handled_reviews
+        for review in healed_reviews
     ]
 
 
@@ -312,19 +312,19 @@ def _created_degraded_results(
     default_args=default_args,
     description="Pipeline for sentiment analysis using OLLAMA model",
     schedule=None,
-    start_date=datetime(2026, 2, 27),
+    start_date=datetime(2025, 12, 7),
     catchup=False,
     tags=["sentiment_analysis", "nlp", "ollama", "yelp_reviews"],
     params={
         "input_file": Param(
             default=Config.INPUT_FILE,
             type="string",
-            description="Path to the input JSON file containing Yelp reviews",
+            description="Path to the input JSON file containing Yelp reviews.",
         ),
         "batch_size": Param(
             default=Config.DEFAULT_BATCH_SIZE,
             type="integer",
-            description="Number of reviews to process in each batch",
+            description="Number of reviews to process in each batch.",
         ),
         "offset": Param(
             default=Config.DEFAULT_OFFSET,
@@ -340,8 +340,7 @@ def _created_degraded_results(
     render_template_as_native_obj=True,
 )
 def self_healing_pipeline():
-    # Implement the self-healing logic here
-    @task()
+    @task
     def load_model():
         context = get_current_context()
         params = context["params"]
@@ -349,32 +348,32 @@ def self_healing_pipeline():
         logger.info(f"Using OLLAMA model: {model_name}")
         return _load_ollama_model(model_name)
 
-    @task()
+    @task
     def load_reviews():
         context = get_current_context()
         params = context["params"]
         batch_size = params.get("batch_size", Config.DEFAULT_BATCH_SIZE)
         offset = params.get("offset", Config.DEFAULT_OFFSET)
-        logger.info(
-            f"Loading reviews with batch size: {batch_size} and offset: {offset}"
-        )
+        logger.info(f"Loading reviews with batch size {batch_size} and offset {offset}")
         return _load_from_file(params, batch_size, offset)
 
-    @task()
+    @task
     def diagnose_and_heal_batch(reviews: list[dict]):
         healed_reviews = [_heal_review(review) for review in reviews]
-        heal_count = sum(1 for r in healed_reviews if r.get("was_healed", True))
-        logger.info(f"Healed {heal_count} out of {len(reviews)} reviews in the batch.")
+        healed_count = sum(1 for r in healed_reviews if r.get("was_healed", True))
+        logger.info(
+            f"Healed {healed_count} out of {len(reviews)} reviews in the batch."
+        )
         return healed_reviews
 
-    @task()
+    @task
     def batch_analyze_sentiment(healed_reviews: list[dict], model_info: dict):
         if not healed_reviews:
             return []
         logger.info(f"Analyzing {len(healed_reviews)} reviews for sentiment.")
-        return _analyzed_with_ollama(healed_reviews, model_info)
+        return _analyze_with_ollama(healed_reviews, model_info)
 
-    @task()
+    @task
     def aggregate_results(results: list[list[dict]]):
         context = get_current_context()
         params = context["params"]
@@ -394,23 +393,23 @@ def self_healing_pipeline():
         healing_stats = {}
         for r in results:
             if r.get("healing_applied"):
-                action = r.get("healing_actions", "unknown")
+                action = r.get("healing_action", "unknown")
                 healing_stats[action] = healing_stats.get(action, 0) + 1
 
-        start_sentiment = {}
+        star_sentiment = {}
         for r in results:
             stars = r.get("stars", 0)
             sentiment = r.get("predicted_sentiment")
-            if stars not in sentiment:
-                key = f"{int(stars)}_stars"
-                if key not in start_sentiment:
-                    start_sentiment[key] = {"POSITIVE": 0, "NEGATIVE": 0, "NEUTRAL": 0}
-            start_sentiment[key][sentiment] += 1
+            if stars and sentiment:
+                key = f"{int(stars)}_star"
+                if key not in star_sentiment:
+                    star_sentiment[stars] = {"POSITIVE": 0, "NEGATIVE": 0, "NEUTRAL": 0}
+                star_sentiment[stars][sentiment] += 1
 
         confidence_by_status = {"success": [], "healed": [], "degraded": []}
         for r in results:
             status = r.get("status")
-            confidence = r.get("confidence", 0)
+            confidence = r.get("confidence", 0.0)
             if status in confidence_by_status:
                 confidence_by_status[status].append(confidence)
 
@@ -434,13 +433,13 @@ def self_healing_pipeline():
             },
             "rates": {
                 "success_rate": round(success_count / max(total, 1), 4),
-                "healed_rate": round(healed_count / max(total, 1), 4),
-                "degraded_rate": round(degraded_count / max(total, 1), 4),
+                "healing_rate": round(healed_count / max(total, 1), 4),
+                "degradation_rate": round(degraded_count / max(total, 1), 4),
             },
             "sentiment_distribution": sentiment_dist,
             "healing_statistics": healing_stats,
-            "start_sentiment_correlation": start_sentiment,
-            "avg_confidence": avg_confidence,
+            "star_sentiment_correlation": star_sentiment,
+            "average_confidence": avg_confidence,
             "results": results,
         }
 
@@ -450,18 +449,17 @@ def self_healing_pipeline():
         output_file = f"{Config.OUTPUT_DIR}/sentiment_analysis_summary_{timestamp}_Offset{offset}.json"
 
         with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=4, default=str, ensure_ascii=False)
+            json.dump(summary, f, indent=2, default=str, ensure_ascii=False)
 
         logger.info(f"Summary written to {output_file}")
         logger.info(
-            f"Processed {total} reviews. {success_count} success, {healed_count} healed, {degraded_count} degraded."
+            f"Processed {total} reviews: {success_count} success, {healed_count} healed, {degraded_count} degraded."
         )
 
         return {k: v for k, v in summary.items() if k != "results"}
 
-    @task()
+    @task
     def generate_health_report(summary: dict):
-        # Generate a health report based on the summary
         total = summary["totals"]["processed"]
         healed = summary["totals"]["healed"]
         degraded = summary["totals"]["degraded"]
@@ -483,17 +481,20 @@ def self_healing_pipeline():
             "metrics": {
                 "total_processed": total,
                 "success_rate": summary["rates"]["success_rate"],
-                "healed_rate": summary["rates"]["healed_rate"],
-                "degraded_rate": summary["rates"]["degraded_rate"],
+                "healing_rate": summary["rates"]["healing_rate"],
+                "degradation_rate": summary["rates"]["degradation_rate"],
             },
             "sentiment_distribution": summary["sentiment_distribution"],
-            "healing_statistics": summary["healing_statistics"],
-            "avg_confidence": summary["avg_confidence"],
+            "healing_summary": summary["healing_statistics"],
+            "average_confidence": summary["average_confidence"],
         }
+
         logger.info(f"Pipeline Health Report: {json.dumps(report, indent=2)}")
-        logger.info(f'Success Rate: {summary["rates"]["success_rate"]}')
-        logger.info(f'Healed Rate: {summary["rates"]["healed_rate"]}')
-        logger.info(f'Degraded Rate: {summary["rates"]["degraded_rate"]}')
+        logger.info(
+            f'Success Rate: {summary["rates"]["success_rate"]}, '
+            f'Healing Rate: {summary["rates"]["healing_rate"]}, '
+            f'Degradation Rate: {summary["rates"]["degradation_rate"]}'
+        )
 
         return report
 
@@ -504,7 +505,7 @@ def self_healing_pipeline():
     analyzed_results = batch_analyze_sentiment(healed_reviews, model_info)
 
     summary = aggregate_results(analyzed_results)
-    generate_health_report = generate_health_report(summary)
+    health_report = generate_health_report(summary)
 
 
-self_healing_pipeline_dag = self_healing_pipeline
+self_healing_pipeline_dag = self_healing_pipeline()
